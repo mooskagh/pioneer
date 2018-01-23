@@ -577,148 +577,226 @@ bool SectorView::RemoveRouteItem(const std::vector<SystemPath>::size_type elemen
 	return true;
 }
 
-void SectorView::ClearRoute()
-{
-	m_route.clear();
+void SectorView::ClearRoute() { m_route.clear(); }
+
+std::vector<SystemPath> SectorView::GetRoute() { return m_route; }
+
+template <class K, class V, class Hash, class Equal>
+class HeapMap {
+ public:
+  using ValType = std::pair<K, V>;
+  void Upsert(const K &key, V value) {
+    const auto iter = m_keypos.find(key);
+    size_t idx;
+    if (iter == m_keypos.end()) {
+      idx = m_heap.size();
+      m_heap.emplace_back();
+    } else {
+      idx = iter->second;
+    }
+    while (idx > 0) {
+      size_t parent = (idx - 1) / 2;
+      if (m_heap[parent].second <= value) break;
+      m_heap[idx] = m_heap[parent];
+      m_keypos[m_heap[idx].first] = idx;
+      idx = parent;
+    }
+    m_heap[idx].first = key;
+    m_heap[idx].second = value;
+    m_keypos[key] = idx;
+  }
+  bool IsEmpty() const { return m_heap.empty(); }
+  K PopKey() { return Pop().first; }
+  ValType Pop() {
+    auto res = m_heap.front();
+    m_keypos.erase(res.first);
+
+    size_t cur_idx = 0;
+    while (true) {
+      size_t prev_idx = 2 * cur_idx + 2;
+      if (m_heap.size() < prev_idx) break;
+      if (m_heap.size() == prev_idx ||
+          m_heap[prev_idx - 1] <= m_heap[prev_idx]) {
+        --prev_idx;
+      }
+      m_heap[cur_idx] = m_heap[prev_idx];
+      m_keypos[m_heap[cur_idx].first] = cur_idx;
+      cur_idx = prev_idx;
+    }
+    if (cur_idx < m_heap.size() - 1) {
+    	m_heap[cur_idx] = m_heap.back();
+      m_keypos[m_heap[cur_idx].first] = cur_idx;
+    }
+    m_heap.pop_back();
+    return res;
+  }
+
+ private:
+  std::unordered_map<K, size_t, Hash, Equal> m_keypos;
+  std::vector<ValType> m_heap;
+};
+
+template <class T>
+inline void hash_combine(std::size_t &seed, T const &v) {
+  seed ^= std::hash<T>()(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
 }
 
-std::vector<SystemPath> SectorView::GetRoute()
-{
-	return m_route;
-}
+struct SystemHash {
+  size_t operator()(const SystemPath &path) const {
+    size_t seed = 0;
+    hash_combine(seed, path.sectorX);
+    hash_combine(seed, path.sectorY);
+    hash_combine(seed, path.sectorZ);
+    hash_combine(seed, path.systemIndex);
+    return seed;
+  }
+};
 
-void SectorView::AutoRoute(const SystemPath &start, const SystemPath &target, std::vector<SystemPath> &outRoute) const
-{
-	const RefCountedPtr<const Sector> start_sec = m_galaxy->GetSector(start);
-	const RefCountedPtr<const Sector> target_sec = m_galaxy->GetSector(target);
+struct SystemEqual {
+  bool operator()(const SystemPath &a, const SystemPath &b) const {
+    return a.sectorX == b.sectorX && a.sectorY == b.sectorY &&
+           a.sectorZ == b.sectorZ && a.systemIndex == b.systemIndex;
+  }
+};
 
-	// Get the player's hyperdrive from Lua, later used to calculate the duration between systems
-	const ScopedTable hyperdrive = ScopedTable(LuaObject<Player>::CallMethod<LuaRef>(Pi::player, "GetEquip", "engine", 1));
-	// Cache max range so it doesn't get recalculated every time we call GetDuration
-	const float max_range = hyperdrive.CallMethod<float>("GetMaximumRange", Pi::player);
+struct SectorPath {
+  Sint32 x, y, z;
+};
 
-	const float dist = Sector::DistanceBetween(start_sec, start.systemIndex, target_sec, target.systemIndex);
+struct SectorHash {
+  size_t operator()(const SectorPath &path) const {
+    size_t seed = 0;
+    hash_combine(seed, path.x);
+    hash_combine(seed, path.y);
+    hash_combine(seed, path.z);
+    return seed;
+  }
+};
 
-	const int sec_dist = ceilf(dist / Sector::SIZE);
+struct SectorEqual {
+  bool operator()(const SectorPath &a, const SectorPath &b) const {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+  }
+};
 
-	// nodes[0] is always start
-	std::vector<SystemPath> nodes;
-	nodes.push_back(start);
+void SectorView::AutoRoute(const SystemPath &start, const SystemPath &target,
+                           std::vector<SystemPath> &outRoute) const {
+  // Get the player's hyperdrive from Lua, later used to calculate the duration
+  // between systems.
+  const ScopedTable hyperdrive =
+      ScopedTable(LuaObject<Player>::CallMethod<LuaRef>(Pi::player, "GetEquip",
+                                                        "engine", 1));
+  // Cache max range so it doesn't get recalculated during GetDuration call.
+  const float max_range = 
+  		hyperdrive.CallMethod<float>("GetMaximumRange", Pi::player);
+  // Radius around current sector, to where a ship can possibly go with one jump
+  const int kSectorRadius = ceilf(max_range / Sector::SIZE) + 1;
 
-	const Sint32 minX = std::min(start.sectorX, target.sectorX)-2, maxX = std::max(start.sectorX, target.sectorX)+2;
-	const Sint32 minY = std::min(start.sectorY, target.sectorY)-2, maxY = std::max(start.sectorY, target.sectorY)+2;
-	const Sint32 minZ = std::min(start.sectorZ, target.sectorZ)-2, maxZ = std::max(start.sectorZ, target.sectorZ)+2;
-	const vector3f start_pos = start_sec->m_systems[start.systemIndex].GetFullPosition();
-	const vector3f target_pos = target_sec->m_systems[target.systemIndex].GetFullPosition();
+  // Keeps sectors, systems from which are considered in the path.
+  std::unordered_map<SectorPath, RefCountedPtr<const Sector>, SectorHash,
+                     SectorEqual>
+      known_sectors;
+  // A heap of current bet f-scores of a system.
+  // (distance to a system from start plus estimation till target).
+  HeapMap<SystemPath, float, SystemHash, SystemEqual> fScore;
+  // A map of current bet g-scores of a system (distance to a system from start)
+  std::unordered_map<SystemPath, float, SystemHash, SystemEqual> gScore;
+  // Set of systems, the distance to which is already known.
+  std::unordered_set<SystemPath, SystemHash, SystemEqual> closed_set;
+  // Used for route reconstruction.
+  std::unordered_map<SystemPath, SystemPath, SystemHash, SystemEqual> came_from;
 
-	// go sector by sector for sec_dist sectors and add systems
-	// if they are within 110% of dist of both start and target
-	for (Sint32 sx = minX; sx <= maxX; sx++) {
-		for (Sint32 sy = minY; sy <= maxY; sy++) {
-			for (Sint32 sz = minZ; sz < maxZ; sz++) {
-				const SystemPath sec_path = SystemPath(sx, sy, sz);
-				RefCountedPtr<const Sector> sec = m_galaxy->GetSector(sec_path);
-				for (std::vector<Sector::System>::size_type s = 0; s < sec->m_systems.size(); s++) {
-					if (start.IsSameSystem(sec->m_systems[s].GetPath()))
-						continue; // start is already nodes[0]
+  // Extracts sector path from system path.
+  auto GetSectorPath = [](const SystemPath &system) {
+    return SectorPath{system.sectorX, system.sectorY, system.sectorZ};
+  };
 
-					const float lineDist = MathUtil::DistanceFromLine(start_pos, target_pos, sec->m_systems[s].GetFullPosition());
+  // If sector is not initialized, fills structures with initial values.
+  // Returns the sector in any case.
+  auto GetSector = [&](const SectorPath &sector) {
+    auto iter = known_sectors.find(sector);
+    if (iter != known_sectors.end()) return iter->second;
+    const SystemPath sec_path = SystemPath(sector.x, sector.y, sector.z);
+    known_sectors[sector] = m_galaxy->GetSector(sec_path);
+    for (const auto &s : known_sectors[sector]->m_systems) {
+      const auto &path = s.GetPath();
+      gScore[path] = INFINITY;
+    }
+    return known_sectors[sector];
+  };
 
-					if (Sector::DistanceBetween(start_sec, start.systemIndex, sec, sec->m_systems[s].idx) <= dist * 1.10 &&
-						Sector::DistanceBetween(target_sec, target.systemIndex, sec, sec->m_systems[s].idx) <= dist * 1.10 &&
-						lineDist<(Sector::SIZE*3))
-					{
-						nodes.push_back(sec->m_systems[s].GetPath());
-					}
-				}
-			}
-		}
-	}
-	Output("SectorView::AutoRoute, nodes to search = %lu\n", nodes.size());
+  const RefCountedPtr<const Sector> target_sec = m_galaxy->GetSector(target);
 
-	// setup inital values and set everything as unvisited
-	std::vector<float> path_dist; // distance from source to node
-	std::vector<std::vector<SystemPath>::size_type> path_prev; // previous node in optimal path
-	std::unordered_set<std::vector<SystemPath>::size_type> unvisited;
-	for (std::vector<SystemPath>::size_type i = 0; i < nodes.size(); i++) {
-		path_dist.push_back(INFINITY);
-		path_prev.push_back(0);
-		unvisited.insert(i);
-	}
+  auto EstimateH = [&](RefCountedPtr<const Sector> sec, int sec_idx) {
+  	auto res = 
+    Sector::DistanceBetween(target_sec, target.systemIndex, sec,
+                                   sec_idx);
+    return 10*res;
+  };
 
-	// distance to the start is 0
-	path_dist[0] = 0.f;
+  auto EstimateDuration = [](float distance) {
+    return distance*distance;
+  };
 
-	size_t totalSkipped = 0u;
-	while (unvisited.size() > 0) {
-		// find the closest node (for the first loop this will be start)
-		std::vector<SystemPath>::size_type closest_i = *unvisited.begin();
-		for (auto it : unvisited) {
-			if (path_dist[it] < path_dist[closest_i])
-				closest_i = it;
-		}
+  // Initialize the starting sector.
+  fScore.Upsert(start,
+                EstimateH(GetSector(GetSectorPath(start)), start.systemIndex));
+  gScore[start] = 0;
 
-		// mark it as visited
-		unvisited.erase(closest_i);
+  // A* search algorithm.
+  while (!fScore.IsEmpty()) {
+    auto cur_path = fScore.PopKey();
+    // Found the best route.
+    //if (cur_path == target) break;
+    if (cur_path.sectorX == target.sectorX &&
+     	  cur_path.sectorY == target.sectorY &&
+     	  cur_path.sectorZ == target.sectorZ &&
+     	  cur_path.systemIndex == target.systemIndex) break;
+    const auto cur_sector_path = GetSectorPath(cur_path);
+    const auto cur_sector = GetSector(cur_sector_path);
+    closed_set.insert(cur_path);
+    const float cur_gScore = gScore[cur_path];
 
-		// if this is the target then we have found the route
-		const SystemPath &closest = nodes[closest_i];
-		if (closest.IsSameSystem(target))
-			break;
+    for (int dx = -kSectorRadius; dx <= kSectorRadius; ++dx) {
+      for (int dy = -kSectorRadius; dy <= kSectorRadius; ++dy) {
+        for (int dz = -kSectorRadius; dz <= kSectorRadius; ++dz) {
+          const SectorPath sec_path{dx + cur_sector_path.x,
+                                    dy + cur_sector_path.y,
+                                    dz + cur_sector_path.z};
+          const auto& sector = GetSector(sec_path);
+          for (const auto &s : sector->m_systems) {
+            const auto &path = s.GetPath();
+            if (closed_set.count(path)) continue;
+            const float dist_ly = Sector::DistanceBetween(
+                cur_sector, cur_path.systemIndex, sector, s.idx);
+            if (dist_ly > max_range) continue;
+            const float new_gScore = cur_gScore + EstimateDuration(dist_ly);
+            auto it = gScore.find(path);
+            if (it != gScore.end() && it->second <= new_gScore) continue;
+            came_from[path] = cur_path;
+            gScore[path] = new_gScore;
+            fScore.Upsert(path,
+                          new_gScore + EstimateH(sector, path.systemIndex));
+          }
+        }
+      }
+    }
+  }
 
-		RefCountedPtr<const Sector> closest_sec = m_galaxy->GetSector(closest);
+  if (came_from.find(target) == came_from.end()) {
+    // Did not manage to build any path.
+    return;
+  }
 
-		// if not, loop through all unvisited nodes
-		// since every system is technically reachable from every other system
-		// everything is a neighbor :)
-		for (auto it : unvisited) {
-			const SystemPath &v = nodes[it];
-			// everything is a neighbor isn't quite true as the ship has a max_range for each jump!
-			if ((SystemPath::SectorDistance(closest, v)*Sector::SIZE) > max_range) {
-				++totalSkipped;
-				continue;
-			}
+  SystemPath cur = target;
 
-			RefCountedPtr<const Sector> v_sec = m_galaxy->GetSector(v); // this causes it to generate a sector (slooooooow)
+  outRoute.clear();
+  while (cur != start) {
+    outRoute.push_back(cur);
+    cur = came_from[cur];
+  }
 
-			const float v_dist_ly = Sector::DistanceBetween(closest_sec, closest.systemIndex, v_sec, v.systemIndex);
-
-			// in this case, duration is used for the distance since that's what we are optimizing
-			float v_dist = hyperdrive.CallMethod<float>("GetDuration", Pi::player, v_dist_ly, max_range);
-
-			v_dist += path_dist[closest_i]; // we want the total duration from start to this node
-			if (v_dist < path_dist[it]) {
-				// if our calculated duration is less than a previous value, this path is more efficent
-				// so store/override it
-				path_dist[it] = v_dist;
-				path_prev[it] = closest_i;
-			}
-		}
-	}
-	Output("SectorView::AutoRoute, total times that nodes were skipped = %lu\n", totalSkipped);
-
-	bool foundRoute = false;
-	std::vector<SystemPath>::size_type u = 0;
-
-	// find the index of our target
-	for (std::vector<SystemPath>::size_type i = 0, numNodes = nodes.size(); i < numNodes; i++) {
-		if (target.IsSameSystem(nodes[i])) {
-			u = i;
-			foundRoute = true;
-			break;
-		}
-	}
-
-	// It's posible that there is no valid route
-	if (foundRoute) {
-		outRoute.reserve(nodes.size());
-		// Build the route, in reverse starting with the target
-		while (u != 0) {
-			outRoute.push_back(nodes[u]);
-			u = path_prev[u];
-		}
-		std::reverse(std::begin(outRoute), std::end(outRoute));
-	}
+  std::reverse(outRoute.begin(), outRoute.end());
 }
 
 void SectorView::DrawRouteLines(const vector3f &playerAbsPos, const matrix4x4f &trans)
